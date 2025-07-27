@@ -7,6 +7,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Deprecated:  use subscriptionManager instead.
+//
 // SubscribeRedisAuctionEvents fans‑out messages coming from any instance
 // to the in‑process Hub.
 func SubscribeRedisAuctionEvents(ctx context.Context, rdb *redis.Client, hub *Hub) {

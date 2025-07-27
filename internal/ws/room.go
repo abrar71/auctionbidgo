@@ -3,7 +3,7 @@ package ws
 import (
 	"sync"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
 )
 
 type room struct {
@@ -23,11 +23,11 @@ func (r *room) remove(c *clientConn) {
 	r.mu.Lock()
 	delete(r.conns, c)
 	r.mu.Unlock()
-	c.rawConn.Close()
+	_ = c.rawConn.Close(websocket.StatusNormalClosure, "")
 }
 
 func (r *room) broadcast(msg []byte) {
-	// Take a quick snapshot of the current connections
+	// snapshot readers
 	r.mu.RLock()
 	conns := make([]*clientConn, 0, len(r.conns))
 	for c := range r.conns {
@@ -38,7 +38,7 @@ func (r *room) broadcast(msg []byte) {
 	// Do the I/O outside the lock
 	var failed []*clientConn
 	for _, c := range conns {
-		if err := c.write(websocket.TextMessage, msg); err != nil {
+		if err := c.write(websocket.MessageText, msg); err != nil {
 			failed = append(failed, c)
 		}
 	}

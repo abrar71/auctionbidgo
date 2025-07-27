@@ -5,10 +5,11 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -16,24 +17,22 @@ import (
 const (
 	writeWait  = 10 * time.Second
 	pongWait   = 12 * time.Second
-	pingPeriod = 3 * time.Second // must be < pongWait to avoid ping timeout
+	pingPeriod = 3 * time.Second // must be < pongWait
 )
 
 type WsServer struct {
 	hub        *Hub
+	subMgr     *subscriptionManager
 	rdc        *redis.Client
 	auctionSvc auction.IAuctionService
-	up         websocket.Upgrader
 }
 
 func NewWsServer(h *Hub, rdc *redis.Client, auctionSvc auction.IAuctionService) *WsServer {
 	return &WsServer{
 		hub:        h,
 		rdc:        rdc,
+		subMgr:     newSubscriptionManager(rdc, h),
 		auctionSvc: auctionSvc,
-		up: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true }, // allow all CORS for dev
-		},
 	}
 }
 
@@ -44,38 +43,42 @@ func (s *WsServer) Handle(ginCtx *gin.Context) {
 		return
 	}
 
-	conn, err := s.up.Upgrade(ginCtx.Writer, ginCtx.Request, nil)
+	rawConn, err := websocket.Accept(
+		ginCtx.Writer, ginCtx.Request,
+		&websocket.AcceptOptions{InsecureSkipVerify: true}, // dev‑only
+	)
 	if err != nil {
-		zap.L().Warn("ws-upgrade", zap.Error(err))
+		zap.L().Warn("ws.accept", zap.Error(err))
 		return
 	}
-	wsConn := &clientConn{rawConn: conn}
+	rawConn.SetReadLimit(512)
 
+	// ─────────────────────────────────── Client joined ─────────────────────────
+	wsConn := &clientConn{rawConn: rawConn}
 	s.hub.Join(auctionID, wsConn)
+	s.subMgr.Subscribe(auctionID) //may be a no‑operation (i.e. already subscribed)
 
-	// Send snapshot synchronously so it is guaranteed to arrive first
+	// send initial snapshot
 	if err := s.pushInitialSnapshot(ginCtx.Request.Context(), auctionID, wsConn); err != nil {
-		zap.L().Warn("ws.snapshot", zap.Error(err))
+		if !strings.Contains(err.Error(), "not found") {
+			zap.L().Warn("ws.snapshot", zap.Error(err))
+		}
 	}
 
-	// Reader (leaves on error/timeout)
 	go s.reader(auctionID, wsConn)
-	// Writer ping keep‑alive
 	go s.pinger(wsConn)
 }
 
-// pushInitialSnapshot now falls back to Postgres when the hash no longer exists.
+// -------------------------------- private helpers ---------------------------
+
 func (s *WsServer) pushInitialSnapshot(ctx context.Context, id string, conn *clientConn) error {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 
-	// Attempt fast‑path from Redis
-	snap, err := s.rdc.HGetAll(ctx, "auc:"+id).Result()
-	if err == nil && len(snap) != 0 {
+	if snap, _ := s.rdc.HGetAll(ctx, "auc:"+id).Result(); len(snap) != 0 {
 		return conn.writeJSON(gin.H{"event": "snapshot", "data": snap})
 	}
 
-	// Fallback: read from database
 	dto, err := s.auctionSvc.GetAuction(ctx, id)
 	if err != nil {
 		return err
@@ -92,20 +95,15 @@ func (s *WsServer) pushInitialSnapshot(ctx context.Context, id string, conn *cli
 }
 
 func (s *WsServer) reader(auctionID string, conn *clientConn) {
-	defer s.hub.Leave(auctionID, conn)
+	defer func() {
+		s.hub.Leave(auctionID, conn)
+		s.subMgr.Unsubscribe(auctionID) // last client? → drop Redis SUB
+	}()
 
-	conn.rawConn.SetReadLimit(512)
-
-	_ = conn.rawConn.SetReadDeadline(time.Now().Add(pongWait))
-
-	conn.rawConn.SetPongHandler(func(string) error {
-		_ = conn.rawConn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-
+	ctx := context.Background()
 	for {
-		if _, _, err := conn.rawConn.ReadMessage(); err != nil {
-			return
+		if _, _, err := conn.rawConn.Read(ctx); err != nil {
+			return // client closed or errored
 		}
 	}
 }
@@ -115,9 +113,11 @@ func (s *WsServer) pinger(conn *clientConn) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// NOW goes through the same mutex as normal messages
-		if err := conn.write(websocket.PingMessage, nil); err != nil {
-			conn.rawConn.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), writeWait)
+		err := conn.rawConn.Ping(ctx)
+		cancel()
+		if err != nil {
+			_ = conn.rawConn.Close(websocket.StatusNormalClosure, "ping timeout")
 			return
 		}
 	}

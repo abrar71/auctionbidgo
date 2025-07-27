@@ -78,7 +78,6 @@ func main() {
 
 	// 7. WebSockets hub + Redis fan‑out
 	hub := ws.NewHub()
-	go ws.SubscribeRedisAuctionEvents(ctx, redisClient, hub)
 
 	// 8. Initialize the WS server
 	wsSrv := ws.NewWsServer(hub, redisClient, auctionService)

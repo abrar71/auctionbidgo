@@ -55,7 +55,7 @@ func (h *httpServer) Start() error {
 	routerEngine.StaticFile("", "public/index.html")
 	routerEngine.StaticFile("/script.js", "public/script.js")
 
-	routerEngine.Use(ginzap.Ginzap(zap.L(), time.RFC3339, true))
+	// routerEngine.Use(ginzap.Ginzap(zap.L(), time.RFC3339, true))
 	routerEngine.Use(ginzap.RecoveryWithZap(zap.L(), true))
 
 	// websocket endpoint

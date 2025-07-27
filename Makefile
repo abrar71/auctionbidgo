@@ -20,3 +20,14 @@ swaginit:
 		--outputTypes "yaml" \
 		--output "api_specs" --instanceName=all_apis \
 		--tags="Auctions"
+
+
+.PHONY: dcup
+dcup:
+	echo "▶️  Starting Docker Compose"
+	docker compose -f docker/docker-compose.yaml up -d
+
+.PHONY: dcdv
+dcdv:
+	echo "▶️  Stopping Docker Compose"
+	docker compose -f docker/docker-compose.yaml down -v

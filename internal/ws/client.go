@@ -1,10 +1,11 @@
 package ws
 
 import (
+	"context"
 	"sync"
-	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 type clientConn struct {
@@ -12,18 +13,20 @@ type clientConn struct {
 	mu      sync.Mutex
 }
 
-func (c *clientConn) write(mt int, data []byte) error {
+func (c *clientConn) write(mt websocket.MessageType, data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), writeWait)
+	defer cancel()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	_ = c.rawConn.SetWriteDeadline(time.Now().Add(writeWait))
-	return c.rawConn.WriteMessage(mt, data) // Text/Binary only
+	return c.rawConn.Write(ctx, mt, data)
 }
 
 func (c *clientConn) writeJSON(v any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), writeWait)
+	defer cancel()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	_ = c.rawConn.SetWriteDeadline(time.Now().Add(writeWait))
-	return c.rawConn.WriteJSON(v)
+	return wsjson.Write(ctx, c.rawConn, v)
 }
