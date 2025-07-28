@@ -74,7 +74,6 @@
     }
 
     button {
-      type: button;
       margin-top: 1rem;
       padding: .55rem 1.1rem;
       border: 0;
@@ -156,6 +155,9 @@
       <label> Auction ID
         <input id="auctionIdInput" type="text" placeholder="auc123" required aria-label="Auction ID">
       </label>
+      <label> User ID
+        <input id="userIdInput" type="text" placeholder="user123" required aria-label="User ID">
+      </label>
       <button id="connectBtn" type="button">Connect</button>
     </section>
 
@@ -179,14 +181,9 @@
       <button id="stopBtn" type="button">Stop auction</button>
     </section>
 
-
-
     <!-- Bid -->
     <section id="bid-section" hidden>
       <h2>Place bid</h2>
-      <label> Bidder ID
-        <input id="bidderIdInput" type="text" placeholder="user123" required aria-label="Bidder ID">
-      </label>
       <label> Amount
         <input id="amountInput" type="number" min="0" step="any" placeholder="10" required aria-label="Bid amount">
       </label>
@@ -200,9 +197,9 @@
       <div id="events" tabindex="0" role="log" aria-live="polite"></div>
     </section>
 
-    <!-- List -->
+    <!-- List --------------------------------------------------------------- -->
     <section id="list-section">
-      <h2>Auctions List (not updated in realtime)</h2>
+      <h2>Auctions List (not updated in realtime)</h2>
       <button id="refreshBtn" type="button">Refresh list</button>
       <table id="listTbl" aria-label="Running auctions">
         <thead>

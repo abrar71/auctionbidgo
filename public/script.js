@@ -1,4 +1,4 @@
-/* global location, WebSocket, fetch */
+/* global location, WebSocket, fetch  */
 
 (() => {
   /* ------------------------------------------------------------ *
@@ -8,8 +8,9 @@
   const $ = id => document.getElementById(id);
 
   const auctionIdInput = $('auctionIdInput');
+  const userIdInput = $('userIdInput');
   const connectBtn = $('connectBtn');
-  const bidderIdInput = $('bidderIdInput');
+
   const amountInput = $('amountInput');
   const bidBtn = $('bidBtn');
 
@@ -32,26 +33,19 @@
   const startBtn = $('startBtn');
   const stopBtn = $('stopBtn');
 
-  const debounce = (fn, ms) => {
-    let handle; return (...a) => { clearTimeout(handle); handle = setTimeout(() => fn(...a), ms); };
-  };
-
+  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
   /* ------------------------------------------------------------ *
    *  SHARED STATE
    * ------------------------------------------------------------ */
   let ws = null;
   let auctionId = '';
+  let userId = '';
   let endsAtUnix = 0;
   let countdownId = null;
-  let retryDelay = 3000;               // ms (exp‑backoff)
+  let retryDelay = 3_000;                // ms (exponential back‑off)
 
-  const WS_STATE = Object.freeze({
-    INIT: 0,
-    OPEN: 1,
-    CLOSING: 2,
-    CLOSED: 3,
-  });
+  const WS_STATE = Object.freeze({ INIT: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   let wsState = WS_STATE.INIT;
 
   /* ------------------------------------------------------------ *
@@ -60,27 +54,32 @@
   connectBtn.addEventListener('click', connect);
   bidBtn.addEventListener('click', placeBid);
   refreshBtn.addEventListener('click', debounce(refreshList, 250));
-
   startBtn.addEventListener('click', startAuction);
   stopBtn.addEventListener('click', stopAuction);
 
+  // Prefill from ?auction=...&user=... query parameters (handy for deep‑links)
   qs.get('auction') && (auctionIdInput.value = qs.get('auction'));
+  qs.get('user') && (userIdInput.value = qs.get('user'));
 
-  refreshList(); // preload table
+  refreshList();                             // initial list fetch
 
   /* ------------------------------------------------------------ *
    *  CONNECTION HANDLING
    * ------------------------------------------------------------ */
   function connect() {
-    if (wsState === WS_STATE.OPEN) return;           // already connected
+    if (wsState === WS_STATE.OPEN) return;   // already connected
+
     auctionId = auctionIdInput.value.trim();
-    if (!auctionId) return alert('Please enter an auction ID.');
+    userId = userIdInput.value.trim();
+    if (!auctionId || !userId) return alert('Please enter both auction ID and user ID.');
 
     disable(connectBtn);
     updateConnStatus('connecting…');
 
     const scheme = location.protocol.startsWith('https') ? 'wss' : 'ws';
-    const url = `${scheme}://${location.host}/ws?auction_id=${encodeURIComponent(auctionId)}`;
+    const url = `${scheme}://${location.host}/ws` +
+      `?auction_id=${encodeURIComponent(auctionId)}` +
+      `&user_id=${encodeURIComponent(userId)}`;
 
     ws = new WebSocket(url);
     wsState = WS_STATE.INIT;
@@ -93,7 +92,7 @@
 
   function handleOpen() {
     wsState = WS_STATE.OPEN;
-    retryDelay = 3000; // reset back‑off
+    retryDelay = 3_000;                      // reset back‑off
     log('📡 connected');
     updateConnStatus('connected');
 
@@ -110,58 +109,66 @@
       log('🏁 auction ended – no reconnection');
       return;
     }
-    // exponential back‑off
     const delay = retryDelay;
-    retryDelay = Math.min(retryDelay + 3000, 30_000);
+    retryDelay = Math.min(retryDelay + 3_000, 30_000);  // exponential back‑off
 
-    log(`🔌 disconnected – retrying in ${delay / 1000}s`);
+    log(`🔌 disconnected – retrying in ${delay / 1_000}s`);
     setTimeout(connect, delay);
   }
 
-  function updateConnStatus(text) { connStatusEl.textContent = `WS: ${text}`; }
+  const updateConnStatus = txt => { connStatusEl.textContent = `WS: ${txt}`; };
 
   /* ------------------------------------------------------------ *
-   *  SERVER → CLIENT EVENTS
+   *  WS EVENT HANDLING  (server → client)
    * ------------------------------------------------------------ */
   function handleEvent(msg) {
     switch (msg.event) {
-      case 'snapshot': applySnapshot(msg.data); break;
-      case 'start': onStart(msg); break;
-      case 'bid': onBid(msg); break;
-      case 'stop': onStop(); break;
+      case 'auctions/snapshot': applySnapshot(msg.body); break;
+      case 'auctions/start': onStart(msg.body); break;
+      case 'auctions/bid': onBid(msg.body); break;
+      case 'auctions/bid-ack': onBidAck(); break;
+      case 'auctions/stop': onStop(); break;
+      case 'error': onError(msg.body?.error); break;
       default: log(`ℹ️ ${JSON.stringify(msg)}`);
     }
   }
 
   function applySnapshot(snap) {
-    if (snap.ea) {
-      endsAtUnix = +snap.ea;
+    // Redis hash uses "ea" (ends‑at); DB snapshots use camel‑case. Handle both.
+    const ea = snap.ea ?? snap.endsAt ?? 0;
+    if (ea) {
+      endsAtUnix = +ea;
       endsAtEl.textContent = tsToLocale(endsAtUnix);
       startCountdown();
     }
-    highBidEl.textContent = snap.hb ?? '0';
-    highBidderEl.textContent = snap.hbid ?? '—';
-    stateEl.textContent = snap.st ?? '—';
+    highBidEl.textContent = snap.hb ?? snap.highBid ?? '0';
+    highBidderEl.textContent = snap.hbid ?? snap.highBidder ?? '—';
+    stateEl.textContent = snap.st ?? snap.status ?? '—';
     log('📷 snapshot received');
 
-    // ★ If the snapshot tells us the auction is over, close the socket immediately.
-    if (snap.st === 'FINISHED') {
-      onStop();               // re‑use existing cleanup logic
-    }
+    if (stateEl.textContent === 'FINISHED') onStop(); // straight to finished state
   }
 
-  function onStart({ endsAt }) {
+  function onStart(body) {
     stateEl.textContent = 'RUNNING';
-    endsAtUnix = +endsAt;
+    endsAtUnix = +body.endsAt;
     endsAtEl.textContent = tsToLocale(endsAtUnix);
     startCountdown();
     log('🚀 auction started');
   }
+
   function onBid({ amount, bidder }) {
     if (amount) highBidEl.textContent = amount;
     if (bidder) highBidderEl.textContent = bidder;
     log(`💰 ${amount} bid by user ${bidder}`);
   }
+
+  function onBidAck() {
+    enable(bidBtn);
+    errorEl.textContent = '';
+    log('✅ bid acknowledged');
+  }
+
   function onStop() {
     stateEl.textContent = 'FINISHED';
     stopCountdown();
@@ -169,42 +176,46 @@
     ws?.close(1000, 'auction finished');
   }
 
-  /* ------------------------------------------------------------ *
-   *  FORM ACTIONS
-   * ------------------------------------------------------------ */
-  async function placeBid() {
-    errorEl.textContent = '';
-    const bidderId = bidderIdInput.value.trim();
-    const amount = +amountInput.value;
-
-    if (!bidderId || !amount) {
-      return alert('Provide both bidder ID and bid amount.');
-    }
-    disable(bidBtn);
-    try {
-      await api(`/auctions/${encodeURIComponent(auctionId)}/bid`, 'POST', {
-        bidder_id: bidderId, amount
-      });
-      amountInput.value = '';
-    } catch (err) {
-      errorEl.textContent = err.message;
-    } finally {
-      enable(bidBtn);
-    }
+  function onError(msg) {
+    enable(bidBtn);
+    errorEl.textContent = msg;
+    log(`⚠️ ${msg}`);
   }
 
-  /* ---------- Manage (start/stop) ------------------------------ */
+  /* ------------------------------------------------------------ *
+   *  CLIENT → SERVER ACTIONS
+   * ------------------------------------------------------------ */
+  function sendWS(event, body) {
+    ws?.send(JSON.stringify({ event, body }));
+  }
+
+  function placeBid() {
+    if (wsState !== WS_STATE.OPEN) return alert('WebSocket not connected.');
+
+    errorEl.textContent = '';
+    const amount = +amountInput.value;
+    if (!amount) return alert('Please enter a bid amount.');
+
+    disable(bidBtn);
+    sendWS('auctions/bid', { amount });
+    amountInput.value = '';                 // clear field (ack/error will re‑enable)
+  }
+
+  /* ---------- Manage (start / stop) ------------------------------------ */
   async function startAuction() {
+    // 5 minute default duration from now
+    const endsAtISO = new Date(Date.now() + 5 * 60 * 1e3).toISOString();
     try {
       await api(`/auctions/${auctionId}/start`, 'POST', {
-        seller_id: 'seller123',
-        ends_at: new Date(Date.now() + 5 * 60 * 1e3).toISOString()
+        seller_id: userId,
+        ends_at: endsAtISO,
       });
     } catch (e) { alert(e.message); }
   }
+
   async function stopAuction() {
     try {
-      await api(`/auctions/${auctionId}/stop?user_id=seller123`, 'POST');
+      await api(`/auctions/${auctionId}/stop`, 'POST');
     } catch (e) { alert(e.message); }
   }
 
@@ -215,9 +226,11 @@
     try {
       const auctions = await api('/auctions?status=RUNNING');
       const frag = document.createDocumentFragment();
+
       auctions.forEach(a => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${a.id}</td><td>${a.high_bid ?? '—'}</td><td>${a.status}</td>`;
+        tr.innerHTML =
+          `<td>${a.id}</td><td>${a.high_bid ?? '—'}</td><td>${a.status}</td>`;
         tr.addEventListener('click', () => { auctionIdInput.value = a.id; connect(); });
         frag.appendChild(tr);
       });
@@ -226,42 +239,28 @@
   }
 
   /* ------------------------------------------------------------ *
-   *  COUNTDOWN
+   *  COUNTDOWN (mm:ss)
    * ------------------------------------------------------------ */
   function startCountdown() {
-    stopCountdown();           // ensure only one timer
+    stopCountdown();                        // ensure only one timer running
+    const tick = () => {
+      const msLeft = endsAtUnix * 1_000 - Date.now();
+      if (msLeft <= 0) { stopCountdown(); return; }
 
-    function tick() {
-      const nowMs = Date.now();
-      const msLeft = endsAtUnix * 1000 - nowMs;
-
-      if (msLeft <= 0) {            // auction over
-        stopCountdown();
-        return;
-      }
-
-      const secs = Math.floor(msLeft / 1000);
+      const secs = Math.floor(msLeft / 1_000);
       const m = String(Math.floor(secs / 60)).padStart(2, '0');
       const s = String(secs % 60).padStart(2, '0');
       timeLeftEl.textContent = `${m}:${s}`;
 
-      /* schedule exactly at the next second boundary              *
-       * (e.g. if 734 ms remain, wait 734 ms, else wait 1000 ms)   */
-      const delay = msLeft % 1000 || 1000;
+      const delay = msLeft % 1_000 || 1_000;
       countdownId = setTimeout(tick, delay);
-    }
-
-    tick();                     // kick‑off immediately
+    };
+    tick();
   }
-
-  function stopCountdown() {
-    clearTimeout(countdownId);
-    countdownId = null;
-    timeLeftEl.textContent = '—';
-  }
+  const stopCountdown = () => { clearTimeout(countdownId); countdownId = null; timeLeftEl.textContent = '—'; };
 
   /* ------------------------------------------------------------ *
-   *  UTIL
+   *  UTILITIES
    * ------------------------------------------------------------ */
   async function api(path, method = 'GET', body) {
     const res = await fetch(path, {
@@ -274,18 +273,15 @@
     return data;
   }
 
-  function log(text) {
+  const log = txt => {
     const div = document.createElement('div');
-    div.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+    div.textContent = `[${new Date().toLocaleTimeString()}] ${txt}`;
     eventsEl.appendChild(div);
     eventsEl.scrollTop = eventsEl.scrollHeight;
-  }
+  };
 
-  function tsToLocale(ts) { return new Date(ts * 1000).toLocaleString(); }
-
-
+  const tsToLocale = ts => new Date(ts * 1_000).toLocaleString();
 
   const disable = el => (el.disabled = true);
   const enable = el => (el.disabled = false);
-
 })();

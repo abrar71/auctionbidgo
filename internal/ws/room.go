@@ -27,7 +27,6 @@ func (r *room) remove(c *clientConn) {
 }
 
 func (r *room) broadcast(msg []byte) {
-	// snapshot readers
 	r.mu.RLock()
 	conns := make([]*clientConn, 0, len(r.conns))
 	for c := range r.conns {
@@ -35,14 +34,13 @@ func (r *room) broadcast(msg []byte) {
 	}
 	r.mu.RUnlock()
 
-	// Do the I/O outside the lock
-	var failed []*clientConn
+	var wg sync.WaitGroup
 	for _, c := range conns {
-		if err := c.write(websocket.MessageText, msg); err != nil {
-			failed = append(failed, c)
-		}
+		wg.Add(1)
+		go func(cc *clientConn) {
+			defer wg.Done()
+			_ = cc.write(websocket.MessageText, msg)
+		}(c)
 	}
-	for _, c := range failed {
-		r.remove(c)
-	}
+	wg.Wait() // ensures ordering; remove if "at‑least‑once" is sufficient
 }

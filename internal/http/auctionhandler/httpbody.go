@@ -2,6 +2,14 @@ package auctionhandler
 
 import "time"
 
+type CreateAuctionBody struct {
+	ID string `json:"id,omitempty" example:"auc123"`
+
+	SellerID string    `json:"seller_id"    binding:"required" example:"seller123"`
+	Item     string    `json:"item"         binding:"required" example:"MacBook Air M3"`
+	EndsAt   time.Time `json:"ends_at"      binding:"required" example:"2025-07-27T16:10:00Z"`
+} // @name CreateAuctionRequest
+
 type StartAuctionBody struct {
 	SellerID string    `json:"seller_id" binding:"required" example:"seller123"`
 	EndsAt   time.Time `json:"ends_at"   binding:"required" example:"2025-07-27T16:05:05Z"`

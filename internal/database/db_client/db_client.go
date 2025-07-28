@@ -17,7 +17,7 @@ func Open(host, port, user, pass, database string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1500)
+	db.SetMaxOpenConns(50)
 	db.SetConnMaxIdleTime(time.Minute)
 	return db, db.Ping()
 }

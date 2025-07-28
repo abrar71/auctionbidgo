@@ -39,7 +39,7 @@ func Run(ctx context.Context, rdc *redis.Client, db *sql.DB) {
 			}
 			entries := res[0].Messages
 			if err := persist(ctx, db, entries); err != nil {
-				zap.L().Error("syncbid.persist", zap.Error(err))
+				// zap.L().Error("syncbid.persist", zap.Error(err))
 			}
 			lastID = entries[len(entries)-1].ID
 		}
@@ -60,6 +60,11 @@ func persist(ctx context.Context, db *sql.DB, msgs []redis.XMessage) error {
 		amt := m.Values["amount"].(string)
 		at := m.Values["at"].(string)
 
+		// zap.L().Debug("persist_bid",
+		// 	zap.String("aid", aid),
+		// 	zap.String("bidder", bidder),
+		// 	zap.String("amount", amt),
+		// )
 		amount, _ := strconv.ParseFloat(amt, 64)
 		ts, _ := strconv.ParseInt(at, 10, 64)
 		if _, err := tx.ExecContext(ctx, ins, aid, bidder, amount, ts); err != nil {

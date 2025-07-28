@@ -84,8 +84,16 @@ func main() {
 
 	// 9. HTTP + WS server
 	httpServer := http_server.NewHttpServer(ctx, cfg.HttpServerPort, wsSrv, auctionService) // Pass the auctionsService when implemented
-	if err := httpServer.Start(); err != nil {
-		Log.Fatal("Failed to start HTTP server", zap.Error(err))
-	}
 
+	go func() {
+		if err := httpServer.Start(); err != nil {
+			Log.Fatal("Failed to start HTTP server", zap.Error(err))
+		}
+	}()
+
+	<-ctx.Done() // wait for signal
+
+	_ = httpServer.Dispose() // graceful‑shutdown
+
+	Log.Info("bye 👋")
 }

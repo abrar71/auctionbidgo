@@ -30,3 +30,10 @@ func (c *clientConn) writeJSON(v any) error {
 	defer c.mu.Unlock()
 	return wsjson.Write(ctx, c.rawConn, v)
 }
+
+// ConnContext gives handlers access to per‑connection data.
+type ConnContext struct {
+	AuctionID string
+	UserID    string
+	Server    *WsServer
+}

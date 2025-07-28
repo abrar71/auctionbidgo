@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -35,15 +36,19 @@ var (
 
 	ErrAlreadyRunning  = errors.New("auction already running")
 	ErrAuctionFinished = errors.New("auction already finished")
+	ErrAuctionExists   = errors.New("auction already exists")
+	ErrAuctionRunning  = errors.New("auction is running, delete forbidden")
 )
 
 type IAuctionService interface {
+	CreateAuction(ctx context.Context, id, sellerID, item string, endsAt time.Time) (string, error)
 	StartAuction(ctx context.Context, auctionID, sellerID string, endsAt time.Time) error
 	StopAuction(ctx context.Context, auctionId string) error
 	PlaceBid(ctx context.Context, auctionId string, userId string, bidAmount float64) error
 	Finalize(ctx context.Context, auctionId string) error
 	GetAuction(ctx context.Context, id string) (*AuctionDTO, error)
 	ListAuctions(ctx context.Context, status string, limit, offset int) ([]AuctionDTO, error)
+	DeleteAuction(ctx context.Context, id string) error
 }
 
 type auctionService struct {
@@ -62,6 +67,36 @@ func NewAuctionService(rdc *redis.Client, db *sql.DB, minInc float64) IAuctionSe
 	}
 }
 
+// CreateAuction persists a row in Postgres in *PENDING* state.
+//   - If `id` is empty a random UUID is generated.
+//   - It fails when an auction with the same ID already exists
+//     (whatever its state).
+func (svc *auctionService) CreateAuction(
+	ctx context.Context, id, sellerID, item string, endsAt time.Time,
+) (string, error) {
+	if id == "" {
+		id = uuid.NewString()
+	}
+
+	// safety – keep max 24 h gap between draft creation and start
+	if endsAt.Before(time.Now().Add(30 * time.Second)) {
+		return "", ErrAuctionClosed
+	}
+
+	const q = `
+      INSERT INTO auctions (id, seller_id, item,
+                            starts_at, ends_at, status)
+           VALUES ($1, $2, $3, now(), $4, 'PENDING')`
+	if _, err := svc.db.ExecContext(ctx, q,
+		id, sellerID, item, endsAt); err != nil {
+		if strings.Contains(err.Error(), "duplicate key") {
+			return "", ErrAuctionExists
+		}
+		return "", err
+	}
+	return id, nil
+}
+
 // Start creates the disposable Redis hash + TTL
 func (svc *auctionService) StartAuction(ctx context.Context, id, seller string, endsAt time.Time) error {
 	ttl := int(time.Until(endsAt).Seconds())
@@ -69,9 +104,12 @@ func (svc *auctionService) StartAuction(ctx context.Context, id, seller string, 
 		return ErrAuctionClosed
 	}
 
-	// check if auction is already running or finished in the DB
+	// DB sanity check (2 s timeout)
+	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
 	var st string
-	err := svc.db.QueryRowContext(ctx, `SELECT status FROM auctions WHERE id = $1`, id).Scan(&st)
+	err := svc.db.QueryRowContext(dbCtx, `SELECT status FROM auctions WHERE id = $1`, id).Scan(&st)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -119,6 +157,10 @@ func (svc *auctionService) StopAuction(ctx context.Context, auctionID string) er
 
 // Bid executes Lua function that performs optimistic check & Pub/Sub.
 func (svc *auctionService) PlaceBid(ctx context.Context, auctionID, bidderID string, amount float64) error {
+
+	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
 	now := time.Now().Unix()
 	res := svc.rdc.FCall(ctx, "auction_place_bid",
 		[]string{
@@ -293,4 +335,56 @@ func ts(s string) time.Time {
 func atof(s string) float64 {
 	v, _ := strconv.ParseFloat(s, 64)
 	return v
+}
+
+// DeleteAuction removes all traces of an auction provided it is not RUNNING.
+func (svc *auctionService) DeleteAuction(ctx context.Context, id string) error {
+	// ── 1. Fast check in Redis (if hash exists) ───────────────────────
+	st, _ := svc.rdc.HGet(ctx, redisAuctionKeyPrefix+id, "st").Result()
+	if st == "RUNNING" {
+		return ErrAuctionRunning
+	}
+
+	// ── 2. Check status in Postgres ───────────────────────────────────
+	var dbStatus string
+	err := svc.db.QueryRowContext(ctx,
+		`SELECT status FROM auctions WHERE id = $1`, id).Scan(&dbStatus)
+
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err // unexpected DB error
+	}
+	if dbStatus == "RUNNING" { // row exists and is RUNNING → forbid
+		return ErrAuctionRunning
+	}
+	if errors.Is(err, sql.ErrNoRows) && st == "" { // nothing to delete
+		return fmt.Errorf("auction %s not found", id)
+	}
+
+	// ── 3. Postgres: delete bids first, then the auction  ─────────────
+	tx, err := svc.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM bids WHERE auction_id = $1`, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM auctions WHERE id = $1`, id); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	// ── 4. Redis: purge keys & sets  (idempotent ops) ─────────────────
+	_ = svc.rdc.Del(ctx,
+		redisAuctionKeyPrefix+id,
+		redisAuctionTimerKeyPrefix+id).Err()
+	_ = svc.rdc.SRem(ctx, "aucs:active", redisAuctionKeyPrefix+id).Err()
+	_ = svc.rdc.SRem(ctx, "aucs:ended", redisAuctionKeyPrefix+id).Err()
+
+	return nil
 }

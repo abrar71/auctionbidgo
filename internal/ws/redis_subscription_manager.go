@@ -2,13 +2,15 @@ package ws
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 // subscriptionManager guarantees that we have **exactly one** Redis
-// subscription per “auc:<id>:events” channel — no matter how many websocket
+// subscription per "auc:<id>:events" channel ― no matter how many websocket
 // clients join the same auction room.
 type subscriptionManager struct {
 	rdb  *redis.Client
@@ -40,7 +42,7 @@ func (sm *subscriptionManager) Subscribe(auctionID string) {
 		return
 	}
 
-	// first consumer → create Redis SUB and fan‑out loop
+	// First consumer → create Redis SUB and fan‑out loop.
 	ctx, cancel := context.WithCancel(context.Background())
 	ps := sm.rdb.Subscribe(ctx, "auc:"+auctionID+":events")
 
@@ -49,15 +51,26 @@ func (sm *subscriptionManager) Subscribe(auctionID string) {
 
 	go func() {
 		defer ps.Close()
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case m, ok := <-ps.Channel():
-				if !ok {
+				if !ok { // Redis connection closed.
 					return
 				}
-				sm.hub.Broadcast(auctionID, []byte(m.Payload))
+
+				// Wrap the raw Redis payload into the public WS envelope so
+				// that **all** messages (server‑initiated *and* client‑initiated)
+				// respect the same router contract format.
+				wrapped, err := wrapRedisEvent(m.Payload)
+				if err != nil {
+					zap.L().Warn("ws.wrap_event_failed", zap.Error(err))
+					wrapped = []byte(m.Payload) // Fallback: forward as‑is.
+				}
+
+				sm.hub.Broadcast(auctionID, wrapped)
 			}
 		}
 	}()
@@ -80,6 +93,34 @@ func (sm *subscriptionManager) Unsubscribe(auctionID string) {
 	delete(sm.subs, auctionID)
 	sm.mu.Unlock()
 
-	// outside the lock → stop the fan‑out goroutine
+	// Outside the lock → stop the fan‑out goroutine.
 	e.cancel()
+}
+
+// ─────────────────────────────── helpers ─────────────────────────────────────
+
+// wrapRedisEvent turns
+//
+//	{"version":1,"event":"bid","bidder":"u1",…}
+//
+// into
+//
+//	{"event":"auctions/bid","body":{"version":1,"bidder":"u1",…}}
+func wrapRedisEvent(payload string) ([]byte, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return nil, err
+	}
+
+	evt, _ := raw["event"].(string)
+	if evt == "" {
+		evt = "unknown"
+	}
+	delete(raw, "event") // Avoid duplication inside “body”.
+
+	env := map[string]interface{}{
+		"event": "auctions/" + evt,
+		"body":  raw,
+	}
+	return json.Marshal(env)
 }
